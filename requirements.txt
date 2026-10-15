@@ -1,0 +1,5 @@
+# 运行时核心零第三方依赖 (使用 Python 3 标准库)
+# Python >= 3.8
+
+# 打包构建可选依赖 (用于编译 macOS 原生 .app 与 DMG 镜像):
+# pyinstaller>=6.0.0
