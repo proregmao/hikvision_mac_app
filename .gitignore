@@ -46,3 +46,11 @@ reset_debug.log
 .idea/
 .vscode/
 *.swp
+
+# Releases and large reference docs
+*.dmg
+*.zip
+hik/
+hik1/
+hik2/
+

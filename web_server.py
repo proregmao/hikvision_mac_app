@@ -25,9 +25,23 @@ if APP_DIR not in sys.path:
 try:
     from hikvision_mac_app.core.scanner import DeviceScanner
     from hikvision_mac_app.core.sadp_protocol import calculate_classic_recovery_code
+    from hikvision_mac_app.core.video_stream import (
+        generate_rtsp_url,
+        detect_installed_players,
+        launch_rtsp_player,
+        get_device_snapshot,
+        control_ptz
+    )
 except ImportError:
     from core.scanner import DeviceScanner
     from core.sadp_protocol import calculate_classic_recovery_code
+    from core.video_stream import (
+        generate_rtsp_url,
+        detect_installed_players,
+        launch_rtsp_player,
+        get_device_snapshot,
+        control_ptz
+    )
 
 scanner = DeviceScanner()
 cached_devices = {}
@@ -132,6 +146,16 @@ HTML_CONTENT = f"""<!DOCTYPE html>
     .qr-card {{ background: #FAFAFC; border: 1px dashed var(--border); border-radius: 10px; padding: 16px; display: flex; flex-direction: column; align-items: center; justify-content: center; margin-bottom: 16px; }}
     .qr-box {{ background: #FFFFFF; padding: 12px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); display: flex; justify-content: center; align-items: center; }}
     .qr-box img, .qr-box canvas {{ display: block; }}
+
+    /* 实时监控监视器与 PTZ 舵盘 */
+    .monitor-screen {{ width: 100%; height: 310px; background: #000; border-radius: 8px; position: relative; overflow: hidden; display: flex; align-items: center; justify-content: center; border: 1px solid #2C2C2E; }}
+    .monitor-screen img {{ max-width: 100%; max-height: 100%; object-fit: contain; display: block; }}
+    .monitor-overlay-hint {{ position: absolute; bottom: 8px; left: 8px; background: rgba(0,0,0,0.65); backdrop-filter: blur(4px); color: #FFF; font-size: 11px; padding: 3px 8px; border-radius: 4px; font-family: Menlo, monospace; }}
+    .ptz-grid {{ display: grid; grid-template-columns: repeat(3, 42px); grid-gap: 6px; justify-content: center; margin: 8px auto; }}
+    .ptz-btn {{ width: 42px; height: 42px; border-radius: 8px; background: #F2F2F7; border: 1px solid var(--border); font-size: 15px; display: flex; align-items: center; justify-content: center; cursor: pointer; user-select: none; transition: all 0.1s; }}
+    .ptz-btn:hover {{ background: #E5E5EA; }}
+    .ptz-btn:active {{ background: #007AFF; color: #FFF; transform: scale(0.95); }}
+    .ptz-btn:disabled {{ opacity: 0.4; cursor: not-allowed; }}
   </style>
 </head>
 <body>
@@ -193,7 +217,7 @@ HTML_CONTENT = f"""<!DOCTYPE html>
             <th>物理 MAC 地址</th>
             <th>设备序列号</th>
             <th>固件版本</th>
-            <th style="text-align:center; width:130px;">操作</th>
+            <th style="text-align:center; width:190px;">操作</th>
           </tr>
         </thead>
         <tbody id="deviceTableBody">
@@ -207,6 +231,130 @@ HTML_CONTENT = f"""<!DOCTYPE html>
   <div style="display:flex; justify-content:space-between; color:var(--text-sub); font-size:12px; padding:0 4px;">
     <span id="localIpHint">正在检测本机 IP...</span>
     <span id="selectedCountHint">共发现 0 台设备 | 已选中 0 台</span>
+  </div>
+
+  <!-- 摄像头实时视频与控制模态框 -->
+  <div id="liveVideoModal" class="modal-overlay">
+    <div class="modal" style="width: 860px; max-width: 95vw;">
+      <div class="modal-title">
+        <span>🎥 摄像头实时视频与云台控制</span>
+        <button class="close-btn" onclick="closeLiveVideoModal()">&times;</button>
+      </div>
+
+      <!-- 设备信息条 -->
+      <div id="videoDevBar" style="background:#F2F2F7; padding:8px 12px; border-radius:8px; font-size:12px; margin-bottom:12px; display:flex; justify-content:space-between; align-items:center;">
+        <div>目标设备: <strong id="videoDevModel">-</strong> (<code id="videoDevIp">-</code>) | MAC: <code id="videoDevMac">-</code></div>
+        <div id="videoDevStatus" class="status-badge"><span class="status-dot"></span><span>就绪</span></div>
+      </div>
+
+      <!-- 双栏排版: 左侧监控屏, 右侧串流与云台 -->
+      <div style="display:flex; gap:16px; flex-wrap:wrap;">
+        <!-- 左侧: 监控画面与抓拍 -->
+        <div style="flex:1; min-width:320px;">
+          <div class="monitor-screen" id="monitorScreen">
+            <img id="liveImg" src="" alt="等待加载画面..." style="display:none;" />
+            <div id="monitorPlaceholder" style="color:#8E8E93; text-align:center; padding:20px;">
+              <div style="font-size:32px; margin-bottom:8px;">📹</div>
+              <div style="font-size:13px; font-weight:600;">暂未加载监控画面</div>
+              <div style="font-size:11px; margin-top:4px; color:#636366;">请输入设备密码并点击下方【📸 立即抓拍】</div>
+            </div>
+            <div id="monitorLoading" style="display:none; position:absolute; color:#FFF; font-size:12px; background:rgba(0,0,0,0.7); padding:6px 14px; border-radius:20px;">
+              ⏳ 正在拉取监控画面...
+            </div>
+            <div id="monitorOverlay" class="monitor-overlay-hint" style="display:none;">LIVE</div>
+          </div>
+
+          <!-- 监视器控制操作栏 -->
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-top:10px;">
+            <div style="display:flex; gap:6px;">
+              <button class="btn btn-sm btn-primary" onclick="fetchSnapshot()">📸 立即抓拍</button>
+              <button class="btn btn-sm" id="continuousBtn" style="background:#34C759; color:#FFF;" onclick="toggleContinuousMonitor()">▶️ 开启连续监控</button>
+              <button class="btn btn-sm" onclick="downloadCurrentSnapshot()">💾 保存截图</button>
+            </div>
+            <div id="fpsHint" style="font-size:11px; color:var(--text-sub);">单帧模式</div>
+          </div>
+        </div>
+
+        <!-- 右侧: RTSP 高清拉流与 PTZ 云台 -->
+        <div style="width:300px; border-left:1px solid var(--border); padding-left:16px;">
+          <!-- 凭证与通道配置 -->
+          <div style="font-weight:700; font-size:12px; color:var(--text-sub); margin-bottom:6px;">⚙️ 流媒体配置</div>
+          <div class="form-row">
+            <div class="form-group" style="flex:1;">
+              <label>管理用户:</label>
+              <input type="text" id="videoUsername" value="admin">
+            </div>
+            <div class="form-group" style="flex:1;">
+              <label>设备密码:</label>
+              <input type="password" id="videoPassword" placeholder="设备密码" oninput="updateRtspUrl()">
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group" style="flex:1;">
+              <label>监控通道:</label>
+              <select id="videoChannel" style="width:100%; padding:7px; border:1px solid var(--border); border-radius:6px; font-size:12px;" onchange="updateRtspUrl()">
+                <option value="1">通道 1</option>
+                <option value="2">通道 2</option>
+                <option value="3">通道 3</option>
+                <option value="4">通道 4</option>
+              </select>
+            </div>
+            <div class="form-group" style="flex:1;">
+              <label>码流类型:</label>
+              <select id="videoStreamType" style="width:100%; padding:7px; border:1px solid var(--border); border-radius:6px; font-size:12px;" onchange="updateRtspUrl()">
+                <option value="1">主码流(高清)</option>
+                <option value="2">子码流(流畅)</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- RTSP 串流与播放器 -->
+          <div style="margin-top:4px; padding:10px; background:#F8F9FB; border-radius:8px; border:1px solid var(--border);">
+            <div style="font-weight:600; font-size:12px; margin-bottom:4px; display:flex; justify-content:space-between;">
+              <span>RTSP 实时视频流:</span>
+              <a href="javascript:void(0)" onclick="copyRtspUrl()" style="font-size:11px; text-decoration:none;">复制地址</a>
+            </div>
+            <input type="text" id="rtspUrlText" readonly style="font-family:Menlo; font-size:10px; padding:4px 6px; background:#FFF; width:100%; margin-bottom:8px;">
+            <div style="display:flex; gap:6px;">
+              <button class="btn btn-sm" style="flex:1; background:#FF9500; color:#FFF;" onclick="playRtsp('VLC')">在 VLC 播放</button>
+              <button class="btn btn-sm" style="flex:1; background:#007AFF; color:#FFF;" onclick="playRtsp('IINA')">在 IINA 播放</button>
+            </div>
+          </div>
+
+          <!-- PTZ 云台舵盘 (根据海康规范) -->
+          <div style="margin-top:12px;">
+            <div style="font-weight:700; font-size:12px; color:var(--text-sub); margin-bottom:4px; display:flex; justify-content:space-between; align-items:center;">
+              <span>🕹️ PTZ 云台控制</span>
+              <span id="ptzStatusHint" style="font-size:10px; color:#888;">速度: 4</span>
+            </div>
+            <div class="ptz-grid">
+              <button class="ptz-btn" title="左上" onmousedown="ptzAction('UP_LEFT')" onmouseup="ptzAction('STOP')">↖</button>
+              <button class="ptz-btn" title="上仰" onmousedown="ptzAction('UP')" onmouseup="ptzAction('STOP')">▲</button>
+              <button class="ptz-btn" title="右上" onmousedown="ptzAction('UP_RIGHT')" onmouseup="ptzAction('STOP')">↗</button>
+              <button class="ptz-btn" title="左转" onmousedown="ptzAction('LEFT')" onmouseup="ptzAction('STOP')">◀</button>
+              <button class="ptz-btn" title="停止" onclick="ptzAction('STOP')" style="font-size:11px; font-weight:700;">STOP</button>
+              <button class="ptz-btn" title="右转" onmousedown="ptzAction('RIGHT')" onmouseup="ptzAction('STOP')">▶</button>
+              <button class="ptz-btn" title="左下" onmousedown="ptzAction('DOWN_LEFT')" onmouseup="ptzAction('STOP')">↙</button>
+              <button class="ptz-btn" title="下俯" onmousedown="ptzAction('DOWN')" onmouseup="ptzAction('STOP')">▼</button>
+              <button class="ptz-btn" title="右下" onmousedown="ptzAction('DOWN_RIGHT')" onmouseup="ptzAction('STOP')">↘</button>
+            </div>
+            <!-- 镜头变倍与聚焦 -->
+            <div style="display:flex; gap:6px; margin-top:6px;">
+              <button class="btn btn-sm" style="flex:1;" onmousedown="ptzAction('ZOOM_IN')" onmouseup="ptzAction('STOP')">🔍 变倍 +</button>
+              <button class="btn btn-sm" style="flex:1;" onmousedown="ptzAction('ZOOM_OUT')" onmouseup="ptzAction('STOP')">🔍 变倍 -</button>
+            </div>
+            <div style="margin-top:8px; display:flex; align-items:center; gap:8px;">
+              <span style="font-size:11px; color:#666;">速度:</span>
+              <input type="range" id="ptzSpeed" min="1" max="7" value="4" style="flex:1;" oninput="document.getElementById('ptzStatusHint').innerText='速度: '+this.value">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style="display:flex; justify-content:flex-end; margin-top:16px;">
+        <button class="btn" onclick="closeLiveVideoModal()">关闭</button>
+      </div>
+    </div>
   </div>
 
   <!-- 新设备激活模态框 -->
@@ -486,7 +634,10 @@ HTML_CONTENT = f"""<!DOCTYPE html>
           ? `<span class="badge" style="background:#E8F5E9; color:#2E7D32; font-weight:600;">已激活</span>`
           : `<span class="badge" style="background:#FFF3E0; color:#E65100; font-weight:700;">未激活</span>`;
         const webUrl = `http://${{d.ip}}:${{d.http_port || 80}}`;
-        let actionBtns = `<a href="${{webUrl}}" target="_blank" class="btn btn-sm" style="text-decoration:none; display:inline-block; padding:3px 8px; font-size:11px; background:#007AFF; color:#fff; border-radius:4px;">打开Web</a>`;
+        let actionBtns = `
+          <button class="btn btn-sm" style="padding:3px 8px; font-size:11px; background:#5856D6; color:#fff; border-radius:4px; margin-right:4px;" onclick="openLiveVideoModal('${{d.mac}}', event)">🎥 实时视频</button>
+          <a href="${{webUrl}}" target="_blank" class="btn btn-sm" style="text-decoration:none; display:inline-block; padding:3px 8px; font-size:11px; background:#007AFF; color:#fff; border-radius:4px;">打开Web</a>
+        `;
         if (!d.activated) {{
           actionBtns = `<button class="btn btn-sm" style="padding:3px 8px; font-size:11px; background:#34C759; color:#fff; border-radius:4px; margin-right:4px;" onclick="openActivateModal('${{d.mac}}', event)">立即激活</button>` + actionBtns;
         }}
@@ -846,6 +997,225 @@ HTML_CONTENT = f"""<!DOCTYPE html>
     function openModal(id) {{ document.getElementById(id).style.display = 'flex'; }}
     function closeModal(id) {{ document.getElementById(id).style.display = 'none'; }}
 
+    // ================== 实时视频与监控控制 ==================
+    let liveVideoDev = null;
+    let monitorTimer = null;
+    let currentSnapshotBlobUrl = null;
+
+    function openLiveVideoModal(mac, event) {{
+      if (event) event.stopPropagation();
+      liveVideoDev = devices.find(d => d.mac === mac);
+      if (!liveVideoDev) return;
+
+      document.getElementById('videoDevModel').innerText = liveVideoDev.model || '海康威视设备';
+      document.getElementById('videoDevIp').innerText = liveVideoDev.ip;
+      document.getElementById('videoDevMac').innerText = liveVideoDev.mac;
+
+      // 如果修改参数框或激活框有输入过密码，自动带入常用密码
+      const autoPwd = document.getElementById('formPassword')?.value || document.getElementById('activatePassword')?.value || '';
+      if (autoPwd && !document.getElementById('videoPassword').value) {{
+        document.getElementById('videoPassword').value = autoPwd;
+      }}
+
+      updateRtspUrl();
+      resetMonitorScreen();
+      openModal('liveVideoModal');
+
+      // 尝试自动拉取一次当前帧
+      if (document.getElementById('videoPassword').value) {{
+        fetchSnapshot();
+      }}
+    }}
+
+    function closeLiveVideoModal() {{
+      stopContinuousMonitor();
+      closeModal('liveVideoModal');
+    }}
+
+    function resetMonitorScreen() {{
+      stopContinuousMonitor();
+      document.getElementById('liveImg').style.display = 'none';
+      document.getElementById('monitorPlaceholder').style.display = 'block';
+      document.getElementById('monitorLoading').style.display = 'none';
+      document.getElementById('monitorOverlay').style.display = 'none';
+      document.getElementById('fpsHint').innerText = '单帧模式';
+    }}
+
+    function updateRtspUrl() {{
+      if (!liveVideoDev) return;
+      const user = document.getElementById('videoUsername').value.trim() || 'admin';
+      const pwd = document.getElementById('videoPassword').value.trim();
+      const ch = parseInt(document.getElementById('videoChannel').value) || 1;
+      const stream = parseInt(document.getElementById('videoStreamType').value) || 1;
+      const chId = ch * 100 + stream;
+      
+      const auth = pwd ? `${{encodeURIComponent(user)}}:${{encodeURIComponent(pwd)}}@` : (user ? `${{encodeURIComponent(user)}}@` : '');
+      const rtsp = `rtsp://${{auth}}${{liveVideoDev.ip}}:554/Streaming/Channels/${{chId}}`;
+      document.getElementById('rtspUrlText').value = rtsp;
+    }}
+
+    function copyRtspUrl() {{
+      const text = document.getElementById('rtspUrlText').value;
+      if (!text) return;
+      navigator.clipboard.writeText(text).then(() => {{
+        alert('RTSP 实时视频流地址已复制到剪贴板！');
+      }}).catch(() => {{
+        prompt('请复制以下 RTSP 地址:', text);
+      }});
+    }}
+
+    async function playRtsp(preferredPlayer) {{
+      const rtspUrl = document.getElementById('rtspUrlText').value;
+      if (!rtspUrl) {{
+        alert('请先确认 RTSP 地址！');
+        return;
+      }}
+      try {{
+        const res = await fetch('/api/device/play_rtsp', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{ rtsp_url: rtspUrl, player: preferredPlayer }})
+        }});
+        const data = await res.json();
+        alert(data.message || (data.success ? '已成功调起播放器！' : '调起失败'));
+      }} catch(e) {{
+        alert('请求失败: ' + e);
+      }}
+    }}
+
+    async function fetchSnapshot() {{
+      if (!liveVideoDev) return;
+      const pwd = document.getElementById('videoPassword').value.trim();
+      const user = document.getElementById('videoUsername').value.trim() || 'admin';
+      const ch = document.getElementById('videoChannel').value || '1';
+      const httpPort = liveVideoDev.http_port || 80;
+
+      if (!pwd) {{
+        alert('请在右侧输入设备管理员密码以抓取实时监控画面！');
+        document.getElementById('videoPassword').focus();
+        return;
+      }}
+
+      document.getElementById('monitorLoading').style.display = 'block';
+      const startTime = Date.now();
+
+      try {{
+        const params = new URLSearchParams({{
+          ip: liveVideoDev.ip,
+          http_port: httpPort,
+          username: user,
+          password: pwd,
+          channel: ch,
+          t: Date.now()
+        }});
+        const res = await fetch(`/api/device/snapshot?${{params.toString()}}`);
+        if (!res.ok) {{
+          const errData = await res.json().catch(() => ({{ message: 'HTTP ' + res.status }}));
+          document.getElementById('monitorLoading').style.display = 'none';
+          document.getElementById('videoDevStatus').innerHTML = '<span class="status-dot" style="background:#FF3B30;"></span><span>鉴权失败</span>';
+          alert(errData.message || '获取监控画面失败，请核对密码！');
+          return;
+        }}
+
+        const blob = await res.blob();
+        if (currentSnapshotBlobUrl) URL.revokeObjectURL(currentSnapshotBlobUrl);
+        currentSnapshotBlobUrl = URL.createObjectURL(blob);
+
+        const img = document.getElementById('liveImg');
+        img.src = currentSnapshotBlobUrl;
+        img.style.display = 'block';
+        document.getElementById('monitorPlaceholder').style.display = 'none';
+        document.getElementById('monitorLoading').style.display = 'none';
+        document.getElementById('monitorOverlay').style.display = 'block';
+        const cost = Date.now() - startTime;
+        document.getElementById('monitorOverlay').innerText = `LIVE | 通道${{ch}} | ${{cost}}ms`;
+        document.getElementById('videoDevStatus').innerHTML = '<span class="status-dot"></span><span>连接正常</span>';
+      }} catch(e) {{
+        document.getElementById('monitorLoading').style.display = 'none';
+        alert('网络通信异常: ' + e);
+      }}
+    }}
+
+    function toggleContinuousMonitor() {{
+      if (monitorTimer) {{
+        stopContinuousMonitor();
+      }} else {{
+        startContinuousMonitor();
+      }}
+    }}
+
+    function startContinuousMonitor() {{
+      const pwd = document.getElementById('videoPassword').value.trim();
+      if (!pwd) {{
+        alert('请先输入设备密码再开启连续监控！');
+        document.getElementById('videoPassword').focus();
+        return;
+      }}
+      document.getElementById('continuousBtn').innerText = '⏸️ 暂停监控';
+      document.getElementById('continuousBtn').style.background = '#FF9500';
+      document.getElementById('fpsHint').innerText = '连续监控中 (1.2秒/帧)';
+      fetchSnapshot();
+      monitorTimer = setInterval(fetchSnapshot, 1200);
+    }}
+
+    function stopContinuousMonitor() {{
+      if (monitorTimer) {{
+        clearInterval(monitorTimer);
+        monitorTimer = null;
+      }}
+      const btn = document.getElementById('continuousBtn');
+      if (btn) {{
+        btn.innerText = '▶️ 开启连续监控';
+        btn.style.background = '#34C759';
+      }}
+      const hint = document.getElementById('fpsHint');
+      if (hint) hint.innerText = '单帧模式';
+    }}
+
+    function downloadCurrentSnapshot() {{
+      const img = document.getElementById('liveImg');
+      if (!img.src || img.style.display === 'none') {{
+        alert('暂无监控截图，请先点击【📸 立即抓拍】！');
+        return;
+      }}
+      const a = document.createElement('a');
+      a.href = img.src;
+      a.download = `Hikvision_Snapshot_${{liveVideoDev ? liveVideoDev.ip : 'dev'}}_${{Date.now()}}.jpg`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    }}
+
+    async function ptzAction(action) {{
+      if (!liveVideoDev) return;
+      const pwd = document.getElementById('videoPassword').value.trim();
+      const user = document.getElementById('videoUsername').value.trim() || 'admin';
+      const ch = document.getElementById('videoChannel').value || '1';
+      const speed = parseInt(document.getElementById('ptzSpeed').value) || 4;
+
+      if (!pwd && action !== 'STOP') {{
+        alert('执行云台操作前，请先在右侧输入设备密码！');
+        document.getElementById('videoPassword').focus();
+        return;
+      }}
+
+      try {{
+        await fetch('/api/device/ptz_control', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{
+            ip: liveVideoDev.ip,
+            http_port: liveVideoDev.http_port || 80,
+            username: user,
+            password: pwd,
+            channel: parseInt(ch),
+            action: action,
+            speed: speed
+          }})
+        }});
+      }} catch(e) {{}}
+    }}
+
     // 初始化加载
     triggerSearch();
   </script>
@@ -912,10 +1282,38 @@ class HikvisionRequestHandler(BaseHTTPRequestHandler):
             body = (official_xml or '').encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'application/xml; charset=utf-8')
-            self.send_header('Content-Disposition', f'attachment; filename="DeviceKey_{mac}.xml"')
-            self.send_header('Content-Length', str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        elif url.path == '/api/device/video_info':
+            params = parse_qs(url.query)
+            mac = params.get('mac', [''])[0]
+            dev = cached_devices.get(mac)
+            players = detect_installed_players()
+            self._send_json({
+                'success': True,
+                'device': dev,
+                'installed_players': players
+            })
+        elif url.path == '/api/device/snapshot':
+            params = parse_qs(url.query)
+            ip = params.get('ip', [''])[0]
+            http_port = int(params.get('http_port', ['80'])[0])
+            username = params.get('username', ['admin'])[0]
+            password = params.get('password', [''])[0]
+            channel = int(params.get('channel', ['1'])[0])
+
+            if not ip:
+                self._send_json({'success': False, 'message': '缺少 IP 参数'}, status=400)
+                return
+
+            ok, img_or_err, ctype = get_device_snapshot(ip, http_port, username, password, channel)
+            if ok:
+                self.send_response(200)
+                self.send_header('Content-Type', ctype)
+                self.send_header('Content-Length', str(len(img_or_err)))
+                self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+                self.end_headers()
+                self.wfile.write(img_or_err)
+            else:
+                self._send_json({'success': False, 'message': str(img_or_err)}, status=400)
         else:
             self.send_error(404, "Not Found")
 
@@ -1024,6 +1422,26 @@ class HikvisionRequestHandler(BaseHTTPRequestHandler):
             now = datetime.date.today()
             code = calculate_classic_recovery_code(sn, now.year, now.month, now.day)
             self._send_json({'code': code})
+
+        elif url.path == '/api/device/play_rtsp':
+            rtsp_url = params.get('rtsp_url')
+            pref = params.get('player')
+            if not rtsp_url:
+                self._send_json({'success': False, 'message': '缺少 RTSP 地址'}, status=400)
+                return
+            ok, msg = launch_rtsp_player(rtsp_url, pref)
+            self._send_json({'success': ok, 'message': msg})
+
+        elif url.path == '/api/device/ptz_control':
+            ip = params.get('ip')
+            http_port = int(params.get('http_port', 80))
+            username = params.get('username', 'admin')
+            password = params.get('password', '')
+            channel = int(params.get('channel', 1))
+            action = params.get('action', 'STOP')
+            speed = int(params.get('speed', 4))
+            ok, msg = control_ptz(ip, http_port, username, password, channel, action, speed)
+            self._send_json({'success': ok, 'message': msg})
 
         else:
             self.send_error(404, "Not Found")
