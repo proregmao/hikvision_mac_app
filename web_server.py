@@ -267,7 +267,7 @@ HTML_CONTENT = f"""<!DOCTYPE html>
           <!-- 监视器控制操作栏 -->
           <div style="display:flex; justify-content:space-between; align-items:center; margin-top:10px;">
             <div style="display:flex; gap:6px;">
-              <button class="btn btn-sm btn-primary" onclick="fetchSnapshot()">📸 立即抓拍</button>
+              <button class="btn btn-sm btn-primary" onclick="fetchSnapshot(true)">📸 立即抓拍</button>
               <button class="btn btn-sm" id="continuousBtn" style="background:#34C759; color:#FFF;" onclick="toggleContinuousMonitor()">▶️ 开启连续监控</button>
               <button class="btn btn-sm" onclick="downloadCurrentSnapshot()">💾 保存截图</button>
             </div>
@@ -1083,20 +1083,34 @@ HTML_CONTENT = f"""<!DOCTYPE html>
       }}
     }}
 
-    async function fetchSnapshot() {{
-      if (!liveVideoDev) return;
+    let isFetchingSnapshot = false;
+
+    async function fetchSnapshot(isManual = false) {{
+      if (!liveVideoDev || isFetchingSnapshot) return;
       const pwd = document.getElementById('videoPassword').value.trim();
       const user = document.getElementById('videoUsername').value.trim() || 'admin';
       const ch = document.getElementById('videoChannel').value || '1';
       const httpPort = liveVideoDev.http_port || 80;
 
       if (!pwd) {{
-        alert('请在右侧输入设备管理员密码以抓取实时监控画面！');
-        document.getElementById('videoPassword').focus();
+        if (isManual) {{
+          alert('请在右侧输入设备管理员密码以抓取实时监控画面！');
+          document.getElementById('videoPassword').focus();
+        }}
+        stopContinuousMonitor();
         return;
       }}
 
-      document.getElementById('monitorLoading').style.display = 'block';
+      isFetchingSnapshot = true;
+      const imgElem = document.getElementById('liveImg');
+      const hasImage = (imgElem.style.display === 'block' && imgElem.src);
+
+      // 仅在当前无画面时，才在屏幕中央显示加载提示；已有画面时进行静默平滑刷新，彻底杜绝闪烁
+      if (!hasImage) {{
+        document.getElementById('monitorLoading').style.display = 'block';
+        document.getElementById('monitorPlaceholder').style.display = 'none';
+      }}
+
       const startTime = Date.now();
 
       try {{
@@ -1110,29 +1124,42 @@ HTML_CONTENT = f"""<!DOCTYPE html>
         }});
         const res = await fetch(`/api/device/snapshot?${{params.toString()}}`);
         if (!res.ok) {{
-          const errData = await res.json().catch(() => ({{ message: 'HTTP ' + res.status }}));
           document.getElementById('monitorLoading').style.display = 'none';
           document.getElementById('videoDevStatus').innerHTML = '<span class="status-dot" style="background:#FF3B30;"></span><span>鉴权失败</span>';
-          alert(errData.message || '获取监控画面失败，请核对密码！');
+          if (res.status === 401 || res.status === 403) {{
+            stopContinuousMonitor();
+            if (isManual) alert('设备访问认证失败：请核对管理员密码！');
+          }}
           return;
         }}
 
         const blob = await res.blob();
-        if (currentSnapshotBlobUrl) URL.revokeObjectURL(currentSnapshotBlobUrl);
-        currentSnapshotBlobUrl = URL.createObjectURL(blob);
+        const nextUrl = URL.createObjectURL(blob);
 
-        const img = document.getElementById('liveImg');
-        img.src = currentSnapshotBlobUrl;
-        img.style.display = 'block';
+        // 双缓冲预解码：图片在内存中解码完毕后再切换渲染，消除白色重绘闪烁
+        const tempImg = new Image();
+        tempImg.src = nextUrl;
+        if (tempImg.decode) {{
+          try {{ await tempImg.decode(); }} catch(e) {{}}
+        }}
+
+        if (currentSnapshotBlobUrl) URL.revokeObjectURL(currentSnapshotBlobUrl);
+        currentSnapshotBlobUrl = nextUrl;
+
+        imgElem.src = nextUrl;
+        imgElem.style.display = 'block';
         document.getElementById('monitorPlaceholder').style.display = 'none';
         document.getElementById('monitorLoading').style.display = 'none';
         document.getElementById('monitorOverlay').style.display = 'block';
+        
         const cost = Date.now() - startTime;
-        document.getElementById('monitorOverlay').innerText = `LIVE | 通道${{ch}} | ${{cost}}ms`;
+        document.getElementById('monitorOverlay').innerHTML = `<span style="display:inline-block; width:6px; height:6px; border-radius:50%; background:#34C759; margin-right:5px; vertical-align:middle;"></span>LIVE | 通道${{ch}} | ${{cost}}ms`;
         document.getElementById('videoDevStatus').innerHTML = '<span class="status-dot"></span><span>连接正常</span>';
       }} catch(e) {{
         document.getElementById('monitorLoading').style.display = 'none';
-        alert('网络通信异常: ' + e);
+        if (isManual) alert('网络通信异常: ' + e);
+      }} finally {{
+        isFetchingSnapshot = false;
       }}
     }}
 
@@ -1153,9 +1180,9 @@ HTML_CONTENT = f"""<!DOCTYPE html>
       }}
       document.getElementById('continuousBtn').innerText = '⏸️ 暂停监控';
       document.getElementById('continuousBtn').style.background = '#FF9500';
-      document.getElementById('fpsHint').innerText = '连续监控中 (1.2秒/帧)';
-      fetchSnapshot();
-      monitorTimer = setInterval(fetchSnapshot, 1200);
+      document.getElementById('fpsHint').innerText = '连续监控中 (平滑刷新)';
+      fetchSnapshot(false);
+      monitorTimer = setInterval(() => fetchSnapshot(false), 1200);
     }}
 
     function stopContinuousMonitor() {{
